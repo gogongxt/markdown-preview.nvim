@@ -122,7 +122,7 @@ end
 -- Index HTML
 ---------------------------------------------------------------------------
 
-local function write_index(dir)
+local function write_index(dir, source_path)
 	local dst = vim.fs.joinpath(dir, M.config.index_name)
 	local src = util.resolve_asset("assets/index.html")
 	if not src then
@@ -151,6 +151,15 @@ local function write_index(dir)
 		if m ~= "hide" and m ~= "raw" then m = "panel" end
 		return m
 	end)
+	-- Bake the source file's display path so the browser can show it in the
+	-- header on first paint, before SSE connects (the 'source' event is only
+	-- reliable on retarget, when a client is already listening). HTML-attribute
+	-- escape: the value lands inside data-source-path="...".
+	local sp = source_path or ""
+	sp = sp:gsub("&", "&amp;"):gsub('"', "&quot;"):gsub("<", "&lt;")
+	content = content:gsub('data%-source%-path="__SOURCE_PATH__"', function()
+		return 'data-source-path="' .. sp .. '"'
+	end)
 
 	-- Inline custom CSS after the bundled styles so user rules win the cascade.
 	if M.config.custom_css and M.config.custom_css ~= "" then
@@ -169,22 +178,28 @@ local function write_index(dir)
 	return dst
 end
 
-local function write_index_if_needed(dir)
+local function write_index_if_needed(dir, source_path)
 	if M.config.overwrite_index_on_start then
-		return write_index(dir)
+		return write_index(dir, source_path)
 	end
 	local dst = vim.fs.joinpath(dir, M.config.index_name)
 	if not util.file_exists(dst) then
-		return write_index(dir)
+		return write_index(dir, source_path)
 	end
-	-- Rewrite a persisted index whose baked token no longer matches what this
-	-- session serves. Covers a fresh token after restart AND a loopback<->
-	-- network switch (which flips whether the token is baked at all) — a stale
-	-- non-empty token on a network bind would otherwise 401 every request.
-	local want = 'data-live-token="' .. (host_is_loopback() and (M._token or "") or "") .. '"'
+	-- Rewrite a persisted index whose baked token OR source path no longer
+	-- matches what this session serves. Covers a fresh token after restart,
+	-- a loopback<->network switch (which flips whether the token is baked at
+	-- all), and a buffer switch (which changes the baked source path) — a
+	-- stale non-empty token on a network bind would otherwise 401 every
+	-- request, and a stale path would show the wrong filename on reload.
+	local want_token = 'data-live-token="' .. (host_is_loopback() and (M._token or "") or "") .. '"'
+	local want_path = 'data-source-path="' .. (source_path or "") .. '"'
 	local ok, existing = pcall(util.read_text, dst)
-	if not ok or not existing:find(want, 1, true) then
-		return write_index(dir)
+	if not ok
+		or not existing:find(want_token, 1, true)
+		or not existing:find(want_path, 1, true)
+	then
+		return write_index(dir, source_path)
 	end
 	return dst
 end
@@ -456,6 +471,38 @@ local function send_scroll_sync(bufnr)
 	end
 end
 
+--- Resolve the source file's path relative to the current working directory,
+--- falling back to the basename (and finally the absolute path) so the header
+--- always has something meaningful. Returns "" for unnamed buffers.
+local function source_display_path(bufnr)
+	local name = vim.api.nvim_buf_get_name(bufnr)
+	if not name or name == "" then return "" end
+	local cwd = vim.fn.getcwd()
+	-- Make both absolute before comparing so a relative cwd can't slip through.
+	local abs_name = vim.fn.fnamemodify(name, ":p")
+	local abs_cwd = vim.fn.fnamemodify(cwd, ":p")
+	if abs_name:sub(1, #abs_cwd) == abs_cwd then
+		local rel = abs_name:sub(#abs_cwd + 1)
+		if rel ~= "" then return rel end
+	end
+	-- Outside the cwd: show the basename rather than a long absolute path.
+	local base = vim.fn.fnamemodify(name, ":t")
+	return base ~= "" and base or name
+end
+
+--- Push the source file's display path to the browser header (live preview).
+--- Sent on start and on retarget so buffer switches update the header live.
+local function send_source(bufnr)
+	local path = source_display_path(bufnr)
+	if path == "" then return end
+	local payload = vim.json.encode({ path = path })
+	if M._server_instance then
+		pcall(ls_server.send_event, M._server_instance, "source", payload)
+	elseif M._takeover_port then
+		require("markdown_preview.remote").send_event(M._takeover_port, "source", payload, M._token)
+	end
+end
+
 ---------------------------------------------------------------------------
 -- Autocmds
 ---------------------------------------------------------------------------
@@ -563,6 +610,7 @@ function M.start()
 			write_content(dir, text, bufnr)
 			M._last_text_by_buf[bufnr] = text
 			set_autocmds_for_buffer(bufnr)
+			send_source(bufnr)
 			if type(M.config.hooks.on_start) == "function" then
 				M.config.hooks.on_start(browser_url(lock_data.port))
 			end
@@ -578,7 +626,7 @@ function M.start()
 		M._token = ls_util.random_token(16)
 	end
 
-	write_index_if_needed(dir)
+	write_index_if_needed(dir, source_display_path(bufnr))
 	write_content(dir, text, bufnr)
 	M._last_text_by_buf[bufnr] = text
 
@@ -670,8 +718,15 @@ function M.start()
 				util.open_in_browser(browser_url(inst.port), M.config.browser)
 			end, 200)
 		end
+
+		-- The browser hasn't connected to SSE yet on a fresh start (it opens
+		-- ~200ms above), so defer the source event until it likely has.
+		vim.defer_fn(function() send_source(bufnr) end, 400)
 	else
-		-- Server already running, retarget to this buffer's workspace
+		-- Server already running, retarget to this buffer's workspace.
+		-- Rewrite the index so its baked source path matches this buffer (a
+		-- reload of the page would otherwise show a stale filename).
+		write_index_if_needed(dir, source_display_path(bufnr))
 		local index_path = vim.fs.joinpath(dir, M.config.index_name)
 		pcall(ls_server.update_target, M._server_instance, dir, index_path)
 		pcall(ls_server.reload, M._server_instance, M.config.content_name)
@@ -686,6 +741,9 @@ function M.start()
 				util.open_in_browser(browser_url(M._server_instance.port), M.config.browser)
 			end, 200)
 		end
+
+		-- Browser is already connected on a retarget; send immediately.
+		send_source(bufnr)
 	end
 end
 

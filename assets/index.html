@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="__THEME__" data-bottom-padding="__BOTTOM_PADDING__" data-mermaid-elk="__MERMAID_ELK__" data-live-token="__LIVE_TOKEN__" data-yaml-mode="__YAML_MODE__" data-allow-html="__ALLOW_HTML__">
+<html lang="en" data-theme="__THEME__" data-bottom-padding="__BOTTOM_PADDING__" data-mermaid-elk="__MERMAID_ELK__" data-live-token="__LIVE_TOKEN__" data-yaml-mode="__YAML_MODE__" data-allow-html="__ALLOW_HTML__" data-source-path="__SOURCE_PATH__">
 
 <head>
     <meta charset="utf-8" />
@@ -139,6 +139,38 @@
             display: flex;
             align-items: center;
             color: var(--fg-muted);
+        }
+
+        /* Source/linked filename, centered in the sticky header. Floats over
+           the spacer region so the brand (left) and status/theme (right) keep
+           their flex positions. Hidden until a name is set. */
+        #header-path {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            max-width: 50%;
+            display: none;
+            align-items: center;
+            gap: .4rem;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+            font-size: .95rem;
+            color: var(--fg);
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            pointer-events: none;
+        }
+
+        #header-path .header-path-icon {
+            display: flex;
+            align-items: center;
+            color: var(--accent);
+            flex-shrink: 0;
+        }
+
+        #header-path .header-path-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .spacer {
@@ -821,6 +853,15 @@
             </svg>
         </span>
         <h1>Markdown Preview</h1>
+        <div id="header-path" title="">
+            <span class="header-path-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <path d="M14 3v4a1 1 0 0 0 1 1h4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                    <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+            </span>
+            <span class="header-path-text"></span>
+        </div>
         <div class="spacer"></div>
         <div id="statusDot" class="status-dot" title="Disconnected"></div>
         <span id="status" aria-live="polite"></span>
@@ -901,6 +942,22 @@
         const themeBtn = $('themeBtn');
         const statusDot = $('statusDot');
         const loadingSkeleton = $('loadingSkeleton');
+        const headerPath = $('header-path');
+        const headerPathText = headerPath && headerPath.querySelector('.header-path-text');
+
+        // Set the centered header filename. Used by render mode (linked file)
+        // and by the live-preview 'source' SSE event (:MarkdownPreview).
+        function setHeaderPath(p) {
+            if (!headerPath || !headerPathText) return;
+            if (!p) {
+                headerPath.style.display = 'none';
+                headerPath.title = '';
+                return;
+            }
+            headerPathText.textContent = p;
+            headerPath.title = p;
+            headerPath.style.display = 'flex';
+        }
 
         // Overlay refs
         const overlay = $('overlay');
@@ -1233,6 +1290,38 @@
             });
         }
 
+        // Same idea for relative links ([label](file.md)). The linked file
+        // lives next to the source markdown, not in the served workspace, so
+        // a bare href 404s against the preview origin. Three cases:
+        //  - .md / .markdown / .mdx: render mode "md" (full pipeline).
+        //  - images / other media (png, jpg, svg, …): go straight to the asset
+        //    route so the browser displays them natively. (Routing binary files
+        //    through render mode would fetch them as text and corrupt them.)
+        //  - everything else (.lua, .c, .py, .txt, …): render mode "code",
+        //    shown as a syntax-highlighted code block. This also avoids the
+        //    download the asset route alone triggers (live-server serves
+        //    unknown MIME as application/octet-stream).
+        // Scheme/path guards as images: leave http(s), protocol-relative,
+        // root-absolute, and fragment links alone.
+        function isMarkdownPath(p) {
+            return /\.(?:md|markdown|mdx)(?:\?.*)?$/i.test(p);
+        }
+        function isMediaPath(p) {
+            return /\.(?:png|jpe?g|gif|svg|ico|webp|avif|bmp)(?:\?.*)?$/i.test(p);
+        }
+        function rewriteRelativeLinks(rootEl) {
+            rootEl.querySelectorAll('a[href]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (!href || /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|\/\/|\/|#)/.test(href)) return;
+                const url = isMediaPath(href)
+                    ? withToken('/__live/asset?p=' + encodeURIComponent(href))
+                    : withToken('/?render=' + encodeURIComponent(href) + '&mode=' + (isMarkdownPath(href) ? 'md' : 'code'));
+                a.setAttribute('href', url);
+                a.setAttribute('target', '_blank');
+                a.setAttribute('rel', 'noopener');
+            });
+        }
+
         function attachCopyButtons() {
             contentEl.querySelectorAll('.code-wrap').forEach(wrap => {
                 if (wrap.querySelector('.copy-btn')) return;
@@ -1301,6 +1390,7 @@
                     wrapper.id = 'content';
                     wrapper.innerHTML = html;
                     rewriteRelativeImages(wrapper);
+                    rewriteRelativeLinks(wrapper);
 
                     window.morphdom(contentEl, wrapper, {
                         childrenOnly: false,
@@ -1327,6 +1417,7 @@
                 } else {
                     contentEl.innerHTML = html;
                     rewriteRelativeImages(contentEl);
+                    rewriteRelativeLinks(contentEl);
                 }
                 applyBottomPadding();
 
@@ -1402,6 +1493,14 @@
             const evtSource = new EventSource(withToken('/__live/events'));
             evtSource.addEventListener('reload', async () => {
                 await sync(false);
+            });
+            evtSource.addEventListener('source', (event) => {
+                // Source filename for the live preview (:MarkdownPreview start
+                // and buffer-switch retargets). Drives the centered header.
+                try {
+                    const data = JSON.parse(event.data);
+                    setHeaderPath(data.path || '');
+                } catch (_) {}
             });
             evtSource.addEventListener('scroll', (event) => {
                 if (scrollSyncPaused) return;
@@ -1565,6 +1664,90 @@
         }
         window.addEventListener('resize', applyBottomPadding);
 
+        // ── Render mode: open a linked file in a new tab ──────────────
+        // When the URL carries ?render=<path>, this page is acting as a
+        // one-shot renderer for that file (opened from a relative link in the
+        // live preview). Fetch it via the asset route (resolved against the
+        // source file's dir) and render it, skipping SSE entirely — no live
+        // reload, no buffer binding. mode "md" renders as Markdown; "code"
+        // renders the file as a single syntax-highlighted code block.
+        async function renderLinkedDoc(path, mode) {
+            document.title = path.split('/').pop() || 'Markdown Preview';
+            // Static one-shot render: no SSE, so hide the connection chrome.
+            if (statusDot) statusDot.style.display = 'none';
+            if (statusEl) statusEl.style.display = 'none';
+            // Filename in the centered header slot.
+            setHeaderPath(path);
+            showContent();
+            contentEl.innerHTML = '<p style="color:var(--fg-muted)">Loading ' +
+                md.utils.escapeHtml(path) + '…</p>';
+            let resp;
+            try {
+                resp = await fetch(withToken('/__live/asset?p=' + encodeURIComponent(path)), { cache: 'no-store' });
+            } catch (e) {
+                contentEl.innerHTML = '<p style="color:var(--err-fg)">Could not load ' +
+                    md.utils.escapeHtml(path) + ': ' + md.utils.escapeHtml(String(e.message || e)) + '</p>';
+                return;
+            }
+            if (!resp.ok) {
+                contentEl.innerHTML = '<p style="color:var(--err-fg)">' + resp.status + ' ' +
+                    md.utils.escapeHtml(resp.statusText || 'error') + ' — ' +
+                    md.utils.escapeHtml(path) + '</p>';
+                return;
+            }
+            const text = (await resp.text()).replace(/\r\n?/g, '\n');
+            try {
+                if (mode === 'code') {
+                    contentEl.innerHTML = renderCodeFile(path, text);
+                } else {
+                    capturedFrontMatter = null;
+                    const html = md.render(text);
+                    contentEl.innerHTML = html;
+                    rewriteRelativeImages(contentEl);
+                    rewriteRelativeLinks(contentEl);
+                    updateFrontMatterPanel();
+
+                    const blocks = contentEl.querySelectorAll('.mermaid-block[data-mermaid-source]:not(.mermaid-rendered)');
+                    for (const block of blocks) {
+                        await renderMermaidBlock(block);
+                    }
+                }
+                applyBottomPadding();
+                attachCopyButtons();
+            } catch (e) {
+                console.error('[markdown-preview] render error:', e);
+                contentEl.innerHTML = '<pre style="white-space:pre-wrap;padding:1rem">' +
+                    text.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</pre>';
+            }
+        }
+
+        // Render a non-markdown source file as a single highlighted code
+        // block, reusing the .code-wrap markup the fence renderer emits so
+        // copy buttons and the language badge work unchanged. Language is
+        // guessed from the extension; falls back to hljs auto-detect, then to
+        // plain escaped text.
+        function renderCodeFile(path, text) {
+            const ext = (path.match(/\.([a-z0-9]+)$/i) || [])[1] || '';
+            const lang = ext.toLowerCase();
+            let highlighted;
+            if (window.hljs) {
+                try {
+                    if (lang && window.hljs.getLanguage(lang)) {
+                        highlighted = window.hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
+                    } else {
+                        highlighted = window.hljs.highlightAuto(text).value;
+                    }
+                } catch (_) {
+                    highlighted = md.utils.escapeHtml(text);
+                }
+            } else {
+                highlighted = md.utils.escapeHtml(text);
+            }
+            const label = md.utils.escapeHtml(lang || 'text');
+            return '<div class="code-wrap"><span class="code-lang">' + label + '</span>' +
+                '<pre class="hljs" data-lang="' + label + '"><code>' + highlighted + '</code></pre></div>';
+        }
+
         // ── Boot ──────────────────────────────────────────────────────
         (async function boot() {
             try {
@@ -1573,6 +1756,22 @@
                     mermaid.registerLayoutLoaders(elkLayouts.default || elkLayouts);
                 }
                 applyTheme(currentTheme);
+
+                // Render mode (?render=<path>&mode=md|code>): one-shot render
+                // of a linked file in this tab. No SSE, no buffer binding.
+                const params = new URLSearchParams(location.search);
+                const renderPath = params.get('render');
+                if (renderPath) {
+                    await renderLinkedDoc(renderPath, params.get('mode'));
+                    return;
+                }
+
+                // Live preview: show the baked source path immediately so the
+                // header has a name on first paint, before SSE connects. The
+                // 'source' SSE event updates it on retarget (buffer switch).
+                const bakedPath = document.documentElement.dataset.sourcePath || '';
+                if (bakedPath && bakedPath !== '__SOURCE_PATH__') setHeaderPath(bakedPath);
+
                 await sync(true);
             } catch (e) {
                 console.error('[markdown-preview] boot error:', e);

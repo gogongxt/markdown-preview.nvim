@@ -5,6 +5,7 @@
 Live **Markdown preview** for Neovim with first-class **Mermaid diagram** support.
 
 - Renders your entire `.md` file in the browser — headings, tables, code blocks, everything
+- **HTML preview** — open any `.html`/`.htm` buffer and `:MarkdownPreview` renders it live in an embedded iframe (scripts, styles, and relative images/CSS/JS load from the file's directory)
 - **Relative images work** — `![](pic.png)` next to your `.md` file renders in the preview
 - **Relative links work** — `[guide](usage.md)` opens the linked `.md` rendered in a new tab; source files like `[license](tests/x.lua)` open as a highlighted code block
 - **Mermaid diagrams** render inline as interactive SVGs (click to expand, zoom, pan, export)
@@ -43,7 +44,7 @@ No prereqs. No `npm install`. Just install and go.
 
 ### Use it
 
-Open any Markdown file, then:
+Open any Markdown file — or an `.html` / `.htm` file — then:
 
 - **Start preview:** `:MarkdownPreview`
 - **Edit freely** — the browser updates instantly as you type
@@ -51,6 +52,8 @@ Open any Markdown file, then:
 - **Stop:** `:MarkdownPreviewStop`
 
 > The first start opens your browser. Subsequent updates reuse the same tab.
+
+**HTML files** (`filetype = html`) are previewed raw in an iframe inside the preview shell — scripts run, and relative CSS/JS/images resolve against the file's directory. See *Security* for the sandbox option.
 
 **`.mmd` / `.mermaid` files** are fully supported — the entire file is rendered as a diagram.
 
@@ -111,6 +114,7 @@ require("markdown_preview").setup({
   browser = nil,
 
   content_name = "content.md",          -- workspace content file
+  html_content_name = "content.html",   -- workspace file for HTML-buffer previews
   index_name = "index.html",            -- workspace HTML file
   custom_css = "",                      -- CSS file layered over bundled styles (~ and $VARS ok; "" = off)
   workspace_dir = nil,                  -- nil = auto (shared for takeover, per-buffer for multi)
@@ -131,6 +135,9 @@ require("markdown_preview").setup({
   yaml_mode = "panel",                  -- front matter: "panel" (collapsible above preview), "hide", or "raw"
 
   allow_raw_html = true,                -- render raw HTML in markdown; set false for untrusted files (see Security)
+
+  html_sandbox = false,                 -- sandbox the HTML-preview iframe; true = scripts/forms/popups only,
+                                        --   no localStorage, scroll sync off (see Security)
 
   scroll_sync = true,                   -- browser follows cursor position
 
@@ -243,6 +250,7 @@ Rendered preview (scroll preserved, no flicker)
 
 - **Rust renderer** (`mermaid_renderer = "rust"`): mermaid fences are pre-rendered to SVG via the `mmdr` CLI before writing to `content.md` — the browser receives ready-made SVGs with no mermaid.js overhead. Failed blocks fall back to browser-side rendering automatically.
 - **Markdown files**: The entire buffer is written to `content.md`
+- **HTML files** (`ft = html`): The entire buffer is written raw to `content.html` and rendered in an iframe inside the preview shell. Relative subresources (CSS/JS/images) are rewritten to the same token-gated asset route markdown images use. The mode reaches the browser three ways: baked into the served `index.html`, the `source` SSE event, and the `reload` event's changed-path basename (which is how takeover secondaries flip it).
 - **Mermaid files** (`.mmd`, `.mermaid`): The entire buffer is wrapped in a mermaid code fence
 - **Other files**: The mermaid block under the cursor is extracted (via Tree-sitter or regex fallback) and wrapped in a code fence
 - **SSE** (Server-Sent Events) from `live-server.nvim` push updates instantly — no polling
@@ -272,6 +280,7 @@ Browser-side libraries are loaded from CDN (cached by your browser):
 
 - **Local by default.** The preview server binds to `127.0.0.1`. Your buffer content (`content.md`), the SSE stream, and the event-injection endpoint all require a per-session 128-bit token; with a non-loopback `host`, the preview page itself requires it too (see *Remote access* above).
 - **Raw HTML is rendered by default** (GitHub-like). HTML embedded in markdown runs inside the preview page, so if you preview markdown you didn't write, set `allow_raw_html = false` to have it rendered as plain text instead.
+- **HTML previews run unsandboxed by default.** A previewed `.html` buffer renders in an iframe that is same-origin with the preview page, so its scripts have the page's privileges (including the live-reload token in `sessionStorage`) — the same trust posture as `allow_raw_html = true`. To preview HTML files you don't trust, set `html_sandbox = true`: the frame gets `sandbox="allow-scripts allow-forms allow-popups"` and an opaque origin (localStorage/cookies/fetch then fail inside it, and cursor scroll sync is disabled for HTML mode).
 - **Browser libraries load from CDNs** (jsdelivr/unpkg, see *Dependencies*). Nothing from your machine is sent to them, but rendering requires internet access. Vendoring the assets locally is planned ([#27](https://github.com/selimacerbas/markdown-preview.nvim/issues/27)).
 - **`custom_css` files are inlined into the preview page** verbatim. Point it only at files you trust.
 - **Relative images are served from the previewed file's directory.** The token-gated asset route can serve *any* file at or below that directory (not just images), so on a non-loopback `host` anyone holding the tokenized URL could request other files there (`.env`, `secrets.txt`, …). Keep sensitive files out of the directory tree you preview from when binding to the network, or prefer an SSH tunnel.
@@ -299,6 +308,13 @@ Browser-side libraries are loaded from CDN (cached by your browser):
 **Browser shows nothing or "Loading..."**
 - Make sure `live-server.nvim` is installed and loadable: `:lua require("live_server")`
 - Check the port isn't in use: change `port` in config
+
+**HTML preview limitations**
+- Relative `<a>` links inside a previewed HTML file navigate the iframe against the workspace and will 404 — v1 previews the buffer itself, not the surrounding site.
+- `srcset` attributes and `url(...)` references inside CSS are not rewritten to the asset route; plain `src`/`href` subresources are.
+- With `html_sandbox = true`, `fetch`/`XHR` to relative URLs fails inside the frame (opaque origin) and `localStorage`/`sessionStorage` access throws.
+- Scrolling inside the iframe with the mouse does not pause cursor-follow scroll sync (iframe wheel events don't reach the parent page).
+- In takeover mode, if a *secondary* instance is previewing HTML, manually refreshing the tab shows the primary's last markdown until the secondary's next edit — only the primary owns the baked index.
 
 **Mermaid diagram not rendering**
 - The diagram syntax must be valid Mermaid — check the error chip on the diagram block

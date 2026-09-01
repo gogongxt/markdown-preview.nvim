@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="__THEME__" data-bottom-padding="__BOTTOM_PADDING__" data-mermaid-elk="__MERMAID_ELK__" data-live-token="__LIVE_TOKEN__" data-yaml-mode="__YAML_MODE__" data-allow-html="__ALLOW_HTML__" data-source-path="__SOURCE_PATH__">
+<html lang="en" data-theme="__THEME__" data-bottom-padding="__BOTTOM_PADDING__" data-mermaid-elk="__MERMAID_ELK__" data-live-token="__LIVE_TOKEN__" data-yaml-mode="__YAML_MODE__" data-allow-html="__ALLOW_HTML__" data-source-path="__SOURCE_PATH__" data-preview-mode="__PREVIEW_MODE__" data-html-sandbox="__HTML_SANDBOX__" data-md-name="__MD_NAME__" data-html-name="__HTML_NAME__">
 
 <head>
     <meta charset="utf-8" />
@@ -328,6 +328,31 @@
 
         #content>*:first-child {
             margin-top: 0
+        }
+
+        /* ── HTML-buffer preview (iframe) ─────────────────────────────── */
+        /* The class lives on <html> (the real scrolling element) so the */
+        /* page stops scrolling while the fixed iframe owns the viewport. */
+        html.html-mode,
+        html.html-mode body {
+            overflow: hidden;
+        }
+
+        #html-frame {
+            display: none;
+            position: fixed;
+            top: var(--header-h, 49px);
+            left: 0;
+            width: 100vw;
+            height: calc(100vh - var(--header-h, 49px));
+            border: 0;
+            background: var(--bg);
+            z-index: 5;
+            /* header is z-index 10 and stays on top */
+        }
+
+        html.html-mode #html-frame {
+            display: block;
         }
 
         /* Headings */
@@ -893,6 +918,9 @@
     </details>
     <div id="content" style="display:none"></div>
 
+    <!-- HTML-buffer preview (ft=html): live raw HTML in an iframe -->
+    <iframe id="html-frame" style="display:none" title="HTML preview"></iframe>
+
     <!-- Fullscreen overlay for diagram zoom/pan -->
     <div id="overlay">
         <div id="overlay-toolbar">
@@ -938,6 +966,7 @@
         // ── DOM refs ──────────────────────────────────────────────────
         const $ = (id) => document.getElementById(id);
         const contentEl = $('content');
+        const htmlFrame = $('html-frame');
         const statusEl = $('status');
         const themeBtn = $('themeBtn');
         const statusDot = $('statusDot');
@@ -1011,6 +1040,28 @@
             return url + (url.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(LIVE_TOKEN);
         };
 
+        // Content filenames + preview mode baked by markdown-preview.nvim.
+        // Only exact-match values are acted on, so unsubstituted '__NAME__'
+        // sentinels (plain-opened assets/index.html) degrade to the defaults.
+        const MD_NAME = (() => {
+            const v = document.documentElement.dataset.mdName || '';
+            return (v && v.indexOf('__') !== 0) ? v : 'content.md';
+        })();
+        const HTML_NAME = (() => {
+            const v = document.documentElement.dataset.htmlName || '';
+            return (v && v.indexOf('__') !== 0) ? v : 'content.html';
+        })();
+        const HTML_SANDBOXED = document.documentElement.dataset.htmlSandbox === 'true';
+
+        // Preview mode: 'md' (markdown-it into #content) or 'html' (raw
+        // buffer in the #html-frame iframe). Switched by the baked attribute
+        // at boot, the 'source' SSE event on retarget, and the 'reload'
+        // event's changed-path basename (covers takeover secondaries).
+        let currentMode = null;
+        let lastHtmlText = null;       // raw fetched HTML (dedup)
+        let htmlSrcdocSeq = 0;         // srcdoc cache-buster
+        let pendingHtmlScroll = null;  // iframe scroll to restore on load
+
         // Scroll sync state
         let scrollSyncPaused = false;
         let scrollSyncPauseTimer = null;
@@ -1048,6 +1099,43 @@
             contentEl.style.display = '';
         }
 
+        // ── Preview mode (md | html) ──────────────────────────────────
+        // Measure the sticky header and expose its height so the fixed
+        // iframe can sit right under it (fallback keeps first paint sane).
+        function layoutHtmlFrame() {
+            const h = document.querySelector('header');
+            if (h) document.documentElement.style.setProperty('--header-h', h.offsetHeight + 'px');
+        }
+
+        function setMode(mode) {
+            if (mode !== 'html') mode = 'md';
+            if (mode === currentMode) return;
+            currentMode = mode;
+            document.documentElement.classList.toggle('html-mode', mode === 'html');
+            if (mode === 'html') {
+                // srcdoc was cleared when leaving html mode, so dedup must
+                // not short-circuit the first render of this html session.
+                lastHtmlText = null;
+                if (loadingSkeleton) loadingSkeleton.style.display = ''; // iframe 'load' hides it
+                contentEl.style.display = 'none';
+                const fm = $('fm-panel');
+                if (fm) fm.style.display = 'none';
+                htmlFrame.style.display = 'block';
+                layoutHtmlFrame();
+            } else {
+                htmlFrame.style.display = 'none';
+                htmlFrame.srcdoc = ''; // unload: stop scripts in a hidden frame
+                // Restore the previous markdown render directly: the md sync
+                // that follows can short-circuit on unchanged content (text
+                // === lastContent), in which case showContent() never runs
+                // and a hidden #content would leave the page blank.
+                if (lastContent != null) {
+                    if (loadingSkeleton) loadingSkeleton.style.display = 'none';
+                    contentEl.style.display = '';
+                }
+            }
+        }
+
         // ── Theme ─────────────────────────────────────────────────────
         function applyTheme(theme) {
             currentTheme = theme;
@@ -1069,7 +1157,9 @@
 
         themeBtn.addEventListener('click', () => {
             applyTheme(currentTheme === 'dark' ? 'light' : 'dark');
-            renderAllMermaidBlocks();
+            // The iframe renders its own document; re-rendering the hidden
+            // markdown tree would be wasted work in html mode.
+            if (currentMode !== 'html') renderAllMermaidBlocks();
         });
 
         // ── Markdown-it setup ─────────────────────────────────────────
@@ -1352,9 +1442,9 @@
         // ── Content sync ──────────────────────────────────────────────
         async function fetchContent() {
             try {
-                const resp = await fetch(withToken('content.md?ts=' + Date.now()), { cache: 'no-store' });
+                const resp = await fetch(withToken(MD_NAME + '?ts=' + Date.now()), { cache: 'no-store' });
                 if (!resp.ok) {
-                    console.warn('[markdown-preview] content.md fetch failed:', resp.status);
+                    console.warn('[markdown-preview] ' + MD_NAME + ' fetch failed:', resp.status);
                     if (resp.status === 401) {
                         // Stale token (server restarted since this tab loaded).
                         // Evict it so the next load bootstraps fresh.
@@ -1364,12 +1454,13 @@
                 }
                 return (await resp.text()).replace(/\r\n?/g, '\n');
             } catch (e) {
-                console.warn('[markdown-preview] content.md fetch error:', e);
+                console.warn('[markdown-preview] ' + MD_NAME + ' fetch error:', e);
                 return null;
             }
         }
 
         async function sync(initial = false) {
+            if (currentMode === 'html') return syncHtml(initial);
             const text = await fetchContent();
             if (text == null) {
                 if (initial) setStatus('Waiting for content...');
@@ -1437,6 +1528,87 @@
             }
         }
 
+        // ── HTML-buffer sync (iframe via srcdoc) ─────────────────────
+        // Mirrors fetchContent, minus CRLF normalization: DOMParser copes
+        // with \r\n, and keeping the raw text makes the dedup faithful.
+        async function fetchHtmlContent() {
+            try {
+                const resp = await fetch(withToken(HTML_NAME + '?ts=' + Date.now()), { cache: 'no-store' });
+                if (!resp.ok) {
+                    console.warn('[markdown-preview] ' + HTML_NAME + ' fetch failed:', resp.status);
+                    if (resp.status === 401) {
+                        try { sessionStorage.removeItem('mdp-token'); } catch (_) {}
+                    }
+                    return null;
+                }
+                return await resp.text();
+            } catch (e) {
+                console.warn('[markdown-preview] ' + HTML_NAME + ' fetch error:', e);
+                return null;
+            }
+        }
+
+        // Relative subresources resolve against the served workspace, which
+        // only contains the rendered content — same problem as markdown
+        // relative images. Rewrite them to the token-gated asset route,
+        // which resolves against the source file's dir. Runs on the parsed
+        // (script-free) DOMParser document before srcdoc assignment, so no
+        // unrewritten request ever fires. Not handled (documented): srcset,
+        // url(...) inside CSS, and <a href> navigation.
+        const REL_URL_GUARD = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|\/\/|\/|#)/;
+        const SUBRESOURCE_ATTRS = [
+            ['img', 'src'], ['script', 'src'], ['link', 'href'],
+            ['source', 'src'], ['video', 'src'], ['video', 'poster'],
+            ['audio', 'src'], ['embed', 'src'], ['track', 'src'], ['iframe', 'src'],
+        ];
+
+        function rewriteRelativeSubresources(doc) {
+            for (const [sel, attr] of SUBRESOURCE_ATTRS) {
+                doc.querySelectorAll(sel + '[' + attr + ']').forEach(el => {
+                    const v = el.getAttribute(attr);
+                    if (!v || REL_URL_GUARD.test(v)) return;
+                    el.setAttribute(attr, withToken('/__live/asset?p=' + encodeURIComponent(v)));
+                });
+            }
+        }
+
+        async function syncHtml(initial = false) {
+            const text = await fetchHtmlContent();
+            if (text == null) {
+                if (initial) setStatus('Waiting for content...');
+                return;
+            }
+            if (!initial && text === lastHtmlText) return;
+            lastHtmlText = text;
+
+            // DOMParser never executes scripts, so rewriting the tree is safe.
+            const doc = new DOMParser().parseFromString(text, 'text/html');
+            rewriteRelativeSubresources(doc);
+
+            // Preserve scroll across reloads (morphdom-equivalent nicety).
+            try { pendingHtmlScroll = htmlFrame.contentWindow.scrollY || 0; } catch (_) { pendingHtmlScroll = null; }
+
+            // outerHTML drops the doctype — re-attach it or the frame enters
+            // quirks mode. The leading comment is spec-legal before <!doctype>
+            // and, more importantly, varies the string: assigning an identical
+            // srcdoc is a no-op that would not reload the frame.
+            htmlSrcdocSeq++;
+            const doctype = doc.doctype ? '<!DOCTYPE ' + doc.doctype.name + '>\n' : '';
+            htmlFrame.srcdoc = '<!--mdp:' + htmlSrcdocSeq + '-->' + doctype + doc.documentElement.outerHTML;
+            setStatus('Updated ' + nowTime());
+        }
+
+        // Fires for every srcdoc assignment AND for the '' unload; ignore
+        // the latter (srcdoc empty ⇒ about:blank).
+        htmlFrame.addEventListener('load', () => {
+            if (!htmlFrame.srcdoc) return;
+            if (loadingSkeleton) loadingSkeleton.style.display = 'none';
+            if (pendingHtmlScroll != null) {
+                try { htmlFrame.contentWindow.scrollTo(0, pendingHtmlScroll); } catch (_) {}
+                pendingHtmlScroll = null;
+            }
+        });
+
         // ── Scroll sync (line-based interpolation) ─────────────────────
         function getElementOffset(el) {
             let current = el;
@@ -1488,18 +1660,50 @@
             window.scrollTo({ top: Math.max(0, offsetTop - window.innerHeight / 2) });
         }
 
+        // HTML mode has no data-source-line anchors; approximate the cursor
+        // position proportionally inside the iframe document. Skipped
+        // entirely when sandboxed: an opaque-origin frame throws on
+        // contentWindow access beyond the allowlist.
+        function scrollHtmlToLine(line, total) {
+            try {
+                const w = htmlFrame.contentWindow;
+                const d = w.document;
+                const ratio = Math.min(1, Math.max(0, line / Math.max(1, total - 1)));
+                const sh = Math.max(d.documentElement.scrollHeight, d.body ? d.body.scrollHeight : 0);
+                w.scrollTo(0, ratio * Math.max(0, sh - w.innerHeight));
+            } catch (_) {}
+        }
+
         // ── SSE (Server-Sent Events from live-server.nvim) ────────────
         function connectSSE() {
             const evtSource = new EventSource(withToken('/__live/events'));
-            evtSource.addEventListener('reload', async () => {
+            evtSource.addEventListener('reload', async (event) => {
+                // The payload carries the changed file's path (bare name from
+                // an explicit reload, full path from fs_watch). Its basename
+                // decides the preview mode — the only signal that reaches the
+                // browser for takeover secondaries, which just write files.
+                // Other watched files (index.html, asset_root) leave it alone.
+                let mode = null;
+                try {
+                    const data = JSON.parse(event.data);
+                    const base = String((data && data.path) || '').split(/[\\/]/).pop();
+                    if (base === HTML_NAME) mode = 'html';
+                    else if (base === MD_NAME) mode = 'md';
+                } catch (_) {}
+                if (mode) setMode(mode);
                 await sync(false);
             });
             evtSource.addEventListener('source', (event) => {
                 // Source filename for the live preview (:MarkdownPreview start
-                // and buffer-switch retargets). Drives the centered header.
+                // and buffer-switch retargets). Drives the centered header;
+                // the mode flips the shell on md<->html buffer switches. No
+                // sync here — a reload event carrying the same mode is always
+                // in flight or already handled.
                 try {
                     const data = JSON.parse(event.data);
                     setHeaderPath(data.path || '');
+                    if (data.mode === 'html') setMode('html');
+                    else if (data.mode === 'md') setMode('md');
                 } catch (_) {}
             });
             evtSource.addEventListener('scroll', (event) => {
@@ -1508,6 +1712,10 @@
                     const data = JSON.parse(event.data);
                     if (data.line == null) return;
                     lastScrollData = data;
+                    if (currentMode === 'html') {
+                        if (!HTML_SANDBOXED) scrollHtmlToLine(data.line, data.total || 1);
+                        return;
+                    }
                     scrollToSourceLine(data.line, data.total || 1);
                 } catch (_) {}
             });
@@ -1651,8 +1859,10 @@
             if (svg) openOverlay(svg);
         });
 
-        // Re-apply scroll when layout shifts (images loading, etc.)
+        // Re-apply scroll when layout shifts (images loading, etc.). Skipped
+        // in html mode: #content is hidden and its geometry is stale.
         new ResizeObserver(() => {
+            if (currentMode === 'html') return;
             if (lastScrollData && !scrollSyncPaused) {
                 scrollToSourceLine(lastScrollData.line, lastScrollData.total || 1);
             }
@@ -1663,6 +1873,7 @@
             contentEl.style.paddingBottom = `${(1 - BOTTOM_PADDING) * window.innerHeight}px`;
         }
         window.addEventListener('resize', applyBottomPadding);
+        window.addEventListener('resize', layoutHtmlFrame);
 
         // ── Render mode: open a linked file in a new tab ──────────────
         // When the URL carries ?render=<path>, this page is acting as a
@@ -1771,6 +1982,15 @@
                 // 'source' SSE event updates it on retarget (buffer switch).
                 const bakedPath = document.documentElement.dataset.sourcePath || '';
                 if (bakedPath && bakedPath !== '__SOURCE_PATH__') setHeaderPath(bakedPath);
+
+                // Preview mode (md|html) baked at index-write time. Exact
+                // match only: any other value (including an unsubstituted
+                // placeholder) falls back to md. The sandbox attribute must
+                // be set before the first srcdoc assignment to take effect.
+                setMode(document.documentElement.dataset.previewMode === 'html' ? 'html' : 'md');
+                if (HTML_SANDBOXED) {
+                    htmlFrame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups');
+                }
 
                 await sync(true);
             } catch (e) {

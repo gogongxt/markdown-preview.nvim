@@ -21,6 +21,9 @@ M.config = {
 	instance_mode = "takeover",
 
 	content_name = "content.md",
+	-- Workspace file written for HTML-buffer previews (ft == "html").
+	-- Served token-gated like content.md; see html_sandbox below.
+	html_content_name = "content.html",
 	index_name = "index.html",
 
 	-- Path to a CSS file injected after the bundled styles, so user rules win
@@ -53,6 +56,14 @@ M.config = {
 	-- Render raw HTML embedded in markdown (GitHub-like). Set false when
 	-- previewing untrusted markdown: raw HTML runs inside the preview page.
 	allow_raw_html = true,
+
+	-- Preview HTML buffers (ft == "html") in an iframe inside the preview
+	-- shell. false (default): the iframe is NOT sandboxed — scripts in the
+	-- buffer run same-origin with the preview page (same trust posture as
+	-- allow_raw_html = true) and cursor scroll sync works.
+	-- true: the iframe gets sandbox="allow-scripts allow-forms allow-popups";
+	-- scroll sync is disabled for HTML mode (opaque origin blocks it).
+	html_sandbox = false,
 
 	-- YAML front matter (--- ... --- at the top of the file):
 	-- "panel" = strip it from the preview, show in a collapsible panel above
@@ -122,7 +133,7 @@ end
 -- Index HTML
 ---------------------------------------------------------------------------
 
-local function write_index(dir, source_path)
+local function write_index(dir, source_path, mode)
 	local dst = vim.fs.joinpath(dir, M.config.index_name)
 	local src = util.resolve_asset("assets/index.html")
 	if not src then
@@ -160,6 +171,21 @@ local function write_index(dir, source_path)
 	content = content:gsub('data%-source%-path="__SOURCE_PATH__"', function()
 		return 'data-source-path="' .. sp .. '"'
 	end)
+	-- Preview mode + content filenames for the browser: it dispatches on
+	-- data-preview-mode at boot and derives the mode from the reload event's
+	-- changed-path basename, so it needs to know both content names.
+	content = content:gsub('data%-preview%-mode="__PREVIEW_MODE__"', function()
+		return 'data-preview-mode="' .. (mode == "html" and "html" or "md") .. '"'
+	end)
+	content = content:gsub('data%-html%-sandbox="__HTML_SANDBOX__"', function()
+		return 'data-html-sandbox="' .. (M.config.html_sandbox and "true" or "false") .. '"'
+	end)
+	content = content:gsub('data%-md%-name="__MD_NAME__"', function()
+		return 'data-md-name="' .. M.config.content_name .. '"'
+	end)
+	content = content:gsub('data%-html%-name="__HTML_NAME__"', function()
+		return 'data-html-name="' .. M.config.html_content_name .. '"'
+	end)
 
 	-- Inline custom CSS after the bundled styles so user rules win the cascade.
 	if M.config.custom_css and M.config.custom_css ~= "" then
@@ -178,28 +204,31 @@ local function write_index(dir, source_path)
 	return dst
 end
 
-local function write_index_if_needed(dir, source_path)
+local function write_index_if_needed(dir, source_path, mode)
 	if M.config.overwrite_index_on_start then
-		return write_index(dir, source_path)
+		return write_index(dir, source_path, mode)
 	end
 	local dst = vim.fs.joinpath(dir, M.config.index_name)
 	if not util.file_exists(dst) then
-		return write_index(dir, source_path)
+		return write_index(dir, source_path, mode)
 	end
-	-- Rewrite a persisted index whose baked token OR source path no longer
-	-- matches what this session serves. Covers a fresh token after restart,
-	-- a loopback<->network switch (which flips whether the token is baked at
-	-- all), and a buffer switch (which changes the baked source path) — a
-	-- stale non-empty token on a network bind would otherwise 401 every
-	-- request, and a stale path would show the wrong filename on reload.
+	-- Rewrite a persisted index whose baked token, source path OR preview
+	-- mode no longer matches what this session serves. Covers a fresh token
+	-- after restart, a loopback<->network switch (which flips whether the
+	-- token is baked at all), and a buffer switch (which changes the baked
+	-- source path and possibly the md<->html mode) — a stale non-empty token
+	-- on a network bind would otherwise 401 every request, and a stale path
+	-- would show the wrong filename on reload.
 	local want_token = 'data-live-token="' .. (host_is_loopback() and (M._token or "") or "") .. '"'
 	local want_path = 'data-source-path="' .. (source_path or "") .. '"'
+	local want_mode = 'data-preview-mode="' .. (mode == "html" and "html" or "md") .. '"'
 	local ok, existing = pcall(util.read_text, dst)
 	if not ok
 		or not existing:find(want_token, 1, true)
 		or not existing:find(want_path, 1, true)
+		or not existing:find(want_mode, 1, true)
 	then
-		return write_index(dir, source_path)
+		return write_index(dir, source_path, mode)
 	end
 	return dst
 end
@@ -344,19 +373,37 @@ local function prerender_mermaid_blocks(text)
 end
 
 ---------------------------------------------------------------------------
--- Content writing (unified: markdown or mermaid)
+-- Content writing (unified: markdown, mermaid or html)
 ---------------------------------------------------------------------------
 
+---Preview mode for a buffer: "html" for ft=html buffers, "md" otherwise.
+local function preview_mode_for(bufnr)
+	return vim.bo[bufnr].filetype == "html" and "html" or "md"
+end
+
+---Workspace content filename for a preview mode.
+local function content_name_for(mode)
+	return mode == "html" and M.config.html_content_name or M.config.content_name
+end
+
 ---Get the content to write based on filetype.
+---HTML buffers: entire buffer, raw (rendered in an iframe by the browser).
 ---Markdown buffers: entire buffer.
 ---Mermaid files (.mmd, .mermaid): entire buffer wrapped in mermaid fence.
 ---Others: mermaid block under cursor wrapped in fence.
 ---@param bufnr integer
----@return string
+---@return string text
+---@return string mode "md"|"html"
 local function get_content(bufnr)
 	local text
+	local mode = "md"
 	local ft = vim.bo[bufnr].filetype
-	if ft == "markdown" then
+	if ft == "html" then
+		-- HTML buffers: raw buffer text, no wrapping, no prerendering
+		local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+		text = table.concat(lines, "\n")
+		mode = "html"
+	elseif ft == "markdown" then
 		local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 		text = table.concat(lines, "\n")
 	elseif vim.api.nvim_buf_get_name(bufnr):match("%.mmd$")
@@ -374,26 +421,33 @@ local function get_content(bufnr)
 	-- is disabled: pre-rendering injects <svg> markup into content.md, which
 	-- markdown-it would escape to literal text under html:false. The browser-
 	-- side renderer handles the fences instead (it doesn't need raw HTML).
-	if M.config.mermaid_renderer == "rust" and M.config.allow_raw_html ~= false and is_mmdr_available() then
+	-- Also gated on md mode: an HTML buffer containing ```mermaid text must
+	-- not be mangled.
+	if mode == "md"
+		and M.config.mermaid_renderer == "rust"
+		and M.config.allow_raw_html ~= false
+		and is_mmdr_available()
+	then
 		text = prerender_mermaid_blocks(text)
 	end
 
-	return text
+	return text, mode
 end
 
 ---Same as get_content but never errors (returns nil on failure).
 ---@param bufnr integer
----@return string|nil
+---@return string|nil text
+---@return string|nil mode "md"|"html"
 local function get_content_safe(bufnr)
-	local ok, text = pcall(get_content, bufnr)
+	local ok, text, mode = pcall(get_content, bufnr)
 	if ok and text and #text > 0 then
-		return text
+		return text, mode
 	end
 	return nil
 end
 
-local function write_content(dir, text, bufnr)
-	local path = vim.fs.joinpath(dir, M.config.content_name)
+local function write_content(dir, text, bufnr, mode)
+	local path = vim.fs.joinpath(dir, content_name_for(mode))
 	util.write_text(path, text)
 	-- Sidecar recording the source file's directory. The server's asset
 	-- route resolves relative image paths against it; using a file (rather
@@ -416,7 +470,7 @@ end
 local function maybe_refresh(bufnr, silent)
 	bufnr = bufnr or vim.api.nvim_get_current_buf()
 
-	local text = get_content_safe(bufnr)
+	local text, mode = get_content_safe(bufnr)
 	if not text then
 		return false
 	end
@@ -426,13 +480,15 @@ local function maybe_refresh(bufnr, silent)
 	end
 
 	local dir = M._workspace_dir or ensure_workspace(bufnr)
-	write_content(dir, text, bufnr)
+	write_content(dir, text, bufnr, mode)
 	M._last_text_by_buf[bufnr] = text
 
-	-- Notify live-server of the content change for immediate SSE push
+	-- Notify live-server of the content change for immediate SSE push.
+	-- The content filename doubles as the mode signal: the browser derives
+	-- md/html mode from the reload event's changed-path basename.
 	-- In secondary takeover mode, M._server_instance is nil — fs_watch handles reload
 	if M._server_instance then
-		pcall(ls_server.reload, M._server_instance, M.config.content_name)
+		pcall(ls_server.reload, M._server_instance, content_name_for(mode))
 	end
 
 	if not silent and M.config.notify_on_refresh then
@@ -490,12 +546,14 @@ local function source_display_path(bufnr)
 	return base ~= "" and base or name
 end
 
---- Push the source file's display path to the browser header (live preview).
---- Sent on start and on retarget so buffer switches update the header live.
+--- Push the source file's display path (and preview mode) to the browser
+--- header (live preview). Sent on start and on retarget so buffer switches
+--- update the header live; the mode lets takeover secondaries flip the
+--- browser between markdown and HTML rendering.
 local function send_source(bufnr)
 	local path = source_display_path(bufnr)
 	if path == "" then return end
-	local payload = vim.json.encode({ path = path })
+	local payload = vim.json.encode({ path = path, mode = preview_mode_for(bufnr) })
 	if M._server_instance then
 		pcall(ls_server.send_event, M._server_instance, "source", payload)
 	elseif M._takeover_port then
@@ -580,7 +638,7 @@ function M.start()
 		return
 	end
 
-	local ok_content, text = pcall(get_content, bufnr)
+	local ok_content, text, mode = pcall(get_content, bufnr)
 	if not ok_content then
 		vim.notify("Markdown Preview: " .. tostring(text), vim.log.levels.ERROR)
 		return
@@ -607,7 +665,7 @@ function M.start()
 			M._is_primary = false
 			M._takeover_port = lock_data.port
 			M._token = lock_data.token
-			write_content(dir, text, bufnr)
+			write_content(dir, text, bufnr, mode)
 			M._last_text_by_buf[bufnr] = text
 			set_autocmds_for_buffer(bufnr)
 			send_source(bufnr)
@@ -626,8 +684,8 @@ function M.start()
 		M._token = ls_util.random_token(16)
 	end
 
-	write_index_if_needed(dir, source_display_path(bufnr))
-	write_content(dir, text, bufnr)
+	write_index_if_needed(dir, source_display_path(bufnr), mode)
+	write_content(dir, text, bufnr, mode)
 	M._last_text_by_buf[bufnr] = text
 
 	set_autocmds_for_buffer(bufnr)
@@ -636,10 +694,14 @@ function M.start()
 	-- vim.pesc escapes every Lua-pattern magic char, so custom content_name /
 	-- index_name values containing '-', '+', '.', etc. still gate correctly.
 	local content_path_pattern = "^/" .. vim.pesc(M.config.content_name) .. "$"
+	-- Gated even in pure-markdown sessions: the server and workspace are
+	-- shared, so a takeover secondary may write content.html later while the
+	-- pattern list is only built once, here, at server start.
+	local html_path_pattern = "^/" .. vim.pesc(M.config.html_content_name) .. "$"
 
 	-- The asset_root sidecar is gated too: it holds the source file's
 	-- directory path, which is nobody's business but ours.
-	local protected = { content_path_pattern, "^/asset_root$" }
+	local protected = { content_path_pattern, html_path_pattern, "^/asset_root$" }
 	if not host_is_loopback() then
 		-- On a network bind the index page must be gated too: it is the
 		-- browser's bootstrap document, and serving it openly would hand the
@@ -724,12 +786,13 @@ function M.start()
 		vim.defer_fn(function() send_source(bufnr) end, 400)
 	else
 		-- Server already running, retarget to this buffer's workspace.
-		-- Rewrite the index so its baked source path matches this buffer (a
-		-- reload of the page would otherwise show a stale filename).
-		write_index_if_needed(dir, source_display_path(bufnr))
+		-- Rewrite the index so its baked source path and preview mode match
+		-- this buffer (a reload of the page would otherwise show a stale
+		-- filename or render HTML buffers as markdown).
+		write_index_if_needed(dir, source_display_path(bufnr), mode)
 		local index_path = vim.fs.joinpath(dir, M.config.index_name)
 		pcall(ls_server.update_target, M._server_instance, dir, index_path)
-		pcall(ls_server.reload, M._server_instance, M.config.content_name)
+		pcall(ls_server.reload, M._server_instance, content_name_for(mode))
 
 		if type(M.config.hooks.on_start) == "function" then
 			M.config.hooks.on_start(browser_url(M._server_instance.port))

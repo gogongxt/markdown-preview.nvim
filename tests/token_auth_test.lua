@@ -2,10 +2,10 @@
 -- End-to-end check that :MarkdownPreview generates a token, threads it into
 -- the served HTML, gates content.md, and that scroll-sync RPC carries it.
 --
--- Run: nvim --headless -c "set rtp+=./live-server-rtp" -c "set rtp+=." \
+-- Run: nvim --headless -c "set rtp+=./kitehost-rtp" -c "set rtp+=." \
 --          -c "luafile tests/token_auth_test.lua" -c "qa!"
 --
--- The CI workflow shims live-server.nvim into ./live-server-rtp before run.
+-- The CI workflow shims kitehost.nvim into ./kitehost-rtp before run.
 
 local uv = vim.loop
 

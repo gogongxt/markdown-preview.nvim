@@ -1,8 +1,8 @@
 -- lua/markdown_preview/init.lua
 local ts = require("markdown_preview.ts")
 local util = require("markdown_preview.util")
-local ls_server = require("live_server.server")
-local ls_util = require("live_server.util")
+local ls_server = require("kitehost.server")
+local ls_util = require("kitehost.util")
 
 local M = {}
 
@@ -100,7 +100,7 @@ M._mmdr_available = nil -- nil = unchecked, true/false after probe
 M._last_scroll_line = nil
 M._is_primary = nil      -- true/false/nil (takeover mode)
 M._takeover_port = nil   -- port of primary server (secondary uses for HTTP events)
-M._token = nil           -- live-server auth token (primary owns; secondaries read from lockfile)
+M._token = nil           -- kitehost auth token (primary owns; secondaries read from lockfile)
 
 local function effective_port()
 	if M.config.port ~= 0 then return M.config.port end
@@ -483,7 +483,7 @@ local function maybe_refresh(bufnr, silent)
 	write_content(dir, text, bufnr, mode)
 	M._last_text_by_buf[bufnr] = text
 
-	-- Notify live-server of the content change for immediate SSE push.
+	-- Notify kitehost of the content change for immediate SSE push.
 	-- The content filename doubles as the mode signal: the browser derives
 	-- md/html mode from the reload event's changed-path basename.
 	-- In secondary takeover mode, M._server_instance is nil — fs_watch handles reload
@@ -711,19 +711,19 @@ function M.start()
 		table.insert(protected, "^/" .. vim.pesc(M.config.index_name) .. "$")
 	end
 
-	-- Relative image support needs the asset route in live-server. The two
+	-- Relative image support needs the asset route in kitehost. The two
 	-- plugins are versioned independently, so warn (once) if the installed
-	-- live-server predates it — images will 404 until it's updated.
+	-- kitehost predates it — images will 404 until it's updated.
 	if not (ls_server.features and ls_server.features.asset_route) and not M._warned_no_asset_route then
 		M._warned_no_asset_route = true
 		vim.notify(
-			"Markdown Preview: relative images need a newer live-server.nvim (with the asset route).\n"
-				.. "Update live-server.nvim, or relative images will not load.",
+			"Markdown Preview: relative images need a newer kitehost.nvim (with the asset route).\n"
+				.. "Update kitehost.nvim, or relative images will not load.",
 			vim.log.levels.WARN
 		)
 	end
 
-	-- Start live-server if not already running
+	-- Start kitehost if not already running
 	if not M._server_instance then
 		local port = effective_port()
 		local index_path = vim.fs.joinpath(dir, M.config.index_name)

@@ -6,9 +6,9 @@
 -- server + workspace with takeover secondaries).
 --
 -- Run: nvim --headless -u NONE \
---   -c "set rtp+=<path-to-live-server.nvim>" \
+--   -c "set rtp+=<path-to-kitehost.nvim>" \
 --   -c "set rtp+=." -c "luafile tests/html_preview_test.lua" -c "qa!"
--- Locally <path-to-live-server.nvim> is ~/.local/share/nvim/lazy/live-server.nvim
+-- Locally <path-to-kitehost.nvim> is ~/.local/share/nvim/lazy/kitehost.nvim
 
 local uv = vim.loop
 
@@ -33,7 +33,7 @@ mp.setup({
 })
 
 -- ─── Capture reload name + source payload via monkeypatch ──────────────────
-local ls_server = require("live_server.server")
+local ls_server = require("kitehost.server")
 local orig_reload, orig_send_event = ls_server.reload, ls_server.send_event
 local cap_reload, cap_source
 ls_server.reload = function(inst, path) cap_reload = path end
